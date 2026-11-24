@@ -12,6 +12,8 @@ from sglang.srt.models.dspark import (
     RNNHead,
     VanillaMarkov,
 )
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dspark_components import dspark_draft_sampler as ds
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
@@ -143,6 +145,16 @@ class TestSampleDraftBlock(CustomTestCase):
 
 
 class TestFusedGreedyEligibility(CustomTestCase):
+    def setUp(self):
+        # The V4 head's markov_w1 is a VocabParallelEmbedding whose forward
+        # reads tp_group (symmetric-memory allocation) even at tp_size 1.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", device="cuda", tp_size=1), role="test")
+        get_parallel().override_permanently(
+            tp_group=SimpleNamespace(world_size=1, rank=0)
+        )
+
     def test_only_the_plain_w2_gemv_head_fuses(self):
         # A head that changes the bias must keep the shared op.
         heads = (
