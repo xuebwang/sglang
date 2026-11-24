@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.kernel_plugins.nvidia import dspark_binding
+from sglang.srt.models.deepseek_v4_dspark import DSparkV4MarkovHead
 from sglang.srt.models.dspark import (
     GatedMarkovHead,
     Nemotron35VanillaMarkov,
@@ -157,10 +158,48 @@ class TestFusedGreedyEligibility(CustomTestCase):
                 False,
             ),
             (RNNHead(vocab_size=VOCAB, markov_rank=RANK, hidden_size=HIDDEN), False),
+            # The V4 head's unsharded bias is the w2 GEMV (its step_bias calls
+            # project_bias), so it fuses; a shard would leave the fused kernel
+            # picking from one shard's columns only.
+            (DSparkV4MarkovHead(vocab_size=VOCAB, markov_rank=RANK), True),
         )
         for head, fuses in heads:
             with self.subTest(head=type(head).__name__):
                 self.assertIs(head.greedy_w2_weight() is not None, fuses)
+
+    def test_v4_head_refuses_when_vocab_sharded(self):
+        # The same predicate the int8-walk gate checks first: the fused
+        # consumers must stay off once the head holds a vocab shard.
+        head = DSparkV4MarkovHead(vocab_size=VOCAB, markov_rank=RANK)
+        head.vocab_shard = SimpleNamespace()
+        self.assertIsNone(head.greedy_w2_weight())
+
+
+    def test_one_row_v4_greedy_draft_takes_the_fused_step_and_matches(self):
+        # bs=1 + greedy draft is the fused step's serving shape for the V4
+        # head; its tokens must match the reference walk (near-ties aside).
+        head = DSparkV4MarkovHead(vocab_size=VOCAB, markov_rank=RANK).to(
+            torch.bfloat16
+        )
+        torch.manual_seed(0)
+        base = torch.randn(1, GAMMA, VOCAB).to(torch.bfloat16)
+        hidden = torch.randn(1, GAMMA, HIDDEN).to(torch.bfloat16)
+        anchor = torch.randint(0, VOCAB, (1,))
+        offset = torch.zeros(1, dtype=torch.int64)
+        block = sample_draft_block(
+            base_logits=base,
+            anchor_tokens=anchor,
+            draft_hidden=hidden,
+            sampling_info=None,
+            markov_head=head,
+            noise=DraftNoise(key=3, offset=offset),
+            device="cpu",
+            tp_sync=SimpleNamespace(sync=lambda site, tokens: tokens),
+            greedy_draft=True,
+        )
+        logits = _step_logits_along(head, base, hidden, anchor, block.draft_tokens)
+        self.assertTrue(torch.equal(block.draft_tokens, logits.float().argmax(-1)))
+        self.assertIsNone(block.corrected_logits)
 
 
 def _folded_draft_model():

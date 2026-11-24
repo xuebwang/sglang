@@ -520,6 +520,14 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         del base_dtype
         return torch.float32
 
+    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        # The fused greedy step and the int8 walk recompute this head's
+        # unsharded bias, the w2 GEMV of W1[prev]; a vocab shard keeps them
+        # off (each would pick a token from one shard's columns only).
+        if self.vocab_shard is not None:
+            return None
+        return self.markov_w2.weight
+
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
         logits = self.project_bias(embed)
